@@ -5,8 +5,9 @@
 #
 # Public entry point for the private kh-svm. Synced automatically to the public
 # KH-Project-Solutions/bootstrap repo — edit here, not there. Prompts for a KH-ServiceBot PAT
-# (repo scope) to pull the private release binary. The PAT is used only for that
-# download and never written to disk; `kh-svm deploy` prompts for it again later.
+# (repo scope) to pull the private release binary; it's then persisted on the
+# host via `kh-svm set-gh-token` (obfuscated, khsvm-only file) so deploy/update
+# and the Cockpit plugin work without re-prompting.
 # For unattended runs, pre-set KH_SVM_PAT in the environment to skip the prompt.
 set -euo pipefail
 
@@ -203,6 +204,15 @@ for _ in $(seq 1 25); do
     [[ -S /run/khsvm/khsvmd.sock ]] && break
     sleep 0.2
 done
+
+# Persist the PAT on the host (kh-svm set-gh-token → /var/lib/khsvm/.ghtoken):
+# deploy/update and the Cockpit plugin then work without a tty. Goes through the
+# daemon (running as khsvm) so the file lands khsvm-owned; the chown covers the
+# in-process fallback (root-owned would be unreadable to the daemon).
+section "Storing the GitHub token"
+KH_SVM_PAT="$KH_SVM_PAT" "$INSTALL_PATH" set-gh-token \
+    || warn "set-gh-token failed — store it later: kh-svm set-gh-token"
+chown khsvm:khsvm /var/lib/khsvm/.ghtoken 2>/dev/null || true
 
 ok "Host provisioned. kh-svm installed at ${INSTALL_PATH}; khsvmd running."
 
