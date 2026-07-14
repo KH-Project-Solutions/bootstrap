@@ -73,9 +73,10 @@ fi
 # `repo` scope authorizes both the release lookup and the asset download.
 section "Installing kh-svm binary"
 API="https://api.github.com/repos/${KH_SVM_REPO}/releases/latest"
-ASSET_ID=$(curl -fsSL -H "Authorization: Bearer ${KH_SVM_PAT}" \
-    -H "Accept: application/vnd.github+json" "$API" \
-    | jq -r '.assets[] | select(.name=="kh-svm") | .id')
+# Keep the whole release JSON — the Cockpit plugin asset is fetched from it later.
+RELEASE_JSON=$(curl -fsSL -H "Authorization: Bearer ${KH_SVM_PAT}" \
+    -H "Accept: application/vnd.github+json" "$API")
+ASSET_ID=$(jq -r '.assets[] | select(.name=="kh-svm") | .id' <<<"$RELEASE_JSON")
 if [[ -z "$ASSET_ID" || "$ASSET_ID" == "null" ]]; then
     echo "No 'kh-svm' asset in the latest release of ${KH_SVM_REPO} (check the token and that a release exists)." >&2
     exit 1
@@ -119,6 +120,56 @@ if ! grep -q '^import /etc/caddy/khsvm/' /etc/caddy/Caddyfile; then
 fi
 systemctl enable --now caddy
 systemctl reload caddy 2>/dev/null || true
+
+# ── Cockpit: host admin UI, localhost-only behind Caddy ──────────────────────
+# Bound to 127.0.0.1:9090 with TLS off — Caddy is the sole public front
+# (kh-svm bind-admin-domain), same posture as instances. --no-install-recommends
+# keeps NetworkManager/packagekit off a server that manages its own networking.
+section "Installing Cockpit (admin UI)"
+apt-get install -y --no-install-recommends cockpit
+install -d /etc/systemd/system/cockpit.socket.d
+cat > /etc/systemd/system/cockpit.socket.d/khsvm.conf <<'EOF'
+[Socket]
+ListenStream=
+ListenStream=127.0.0.1:9090
+EOF
+# Plain HTTP on loopback; Caddy terminates TLS. cockpit-ws's path varies across
+# releases, so resolve it.
+WS_BIN=/usr/libexec/cockpit-ws
+[[ -x $WS_BIN ]] || WS_BIN=/usr/lib/cockpit/cockpit-ws
+install -d /etc/systemd/system/cockpit.service.d
+cat > /etc/systemd/system/cockpit.service.d/khsvm.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=${WS_BIN} --no-tls
+EOF
+# Trust Caddy's forwarded proto/IP so origin checks and logs work under the
+# https admin domain. Written once — don't clobber operator edits on rerun.
+if [[ ! -e /etc/cockpit/cockpit.conf ]]; then
+    install -d /etc/cockpit
+    cat > /etc/cockpit/cockpit.conf <<'EOF'
+[WebService]
+ProtocolHeader = X-Forwarded-Proto
+ForwardedForHeader = X-Forwarded-For
+EOF
+fi
+systemctl daemon-reload
+systemctl enable --now cockpit.socket
+systemctl try-restart cockpit.service 2>/dev/null || true
+
+# kh-svm Cockpit plugin, from the same release as the binary (static files —
+# Cockpit picks them up on page load, no restart). Absent on pre-plugin
+# releases; `kh-svm upgrade-daemon` refreshes it alongside the binary.
+PLUGIN_ID=$(jq -r '.assets[] | select(.name=="khsvm-cockpit.tar.gz") | .id' <<<"$RELEASE_JSON")
+if [[ -n "$PLUGIN_ID" && "$PLUGIN_ID" != "null" ]]; then
+    rm -rf /usr/share/cockpit/khsvm
+    install -d /usr/share/cockpit/khsvm
+    curl -fsSL -H "Authorization: Bearer ${KH_SVM_PAT}" -H "Accept: application/octet-stream" \
+        "https://api.github.com/repos/${KH_SVM_REPO}/releases/assets/${PLUGIN_ID}" \
+        | tar -xz -C /usr/share/cockpit/khsvm
+else
+    warn "latest release has no khsvm-cockpit.tar.gz — Cockpit plugin skipped"
+fi
 
 # systemd unit. RuntimeDirectory gives the daemon a writable /run/khsvm for its
 # socket; 0755 so the operator can traverse it, while the socket itself is
