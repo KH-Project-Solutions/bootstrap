@@ -97,7 +97,7 @@ usermod -aG docker khsvm
 # State dir (owned by khsvm; the binary defaults here — see kh-svm state.rs).
 install -d -o khsvm -g khsvm -m 0750 /var/lib/khsvm
 
-# ── Caddy: reverse proxy for kh-svm instances (kh-svm bind-domain) ───────────
+# ── Caddy: reverse proxy for kh-svm instances (kh-svm domain bind) ───────────
 # Instances listen on 127.0.0.1 only; Caddy is the public front (TLS + vhosts).
 # kh-svm writes one site file per instance into /etc/caddy/khsvm/ and reloads
 # Caddy via its admin API — so the khsvm daemon needs no root, only ownership of
@@ -112,7 +112,7 @@ if ! command -v caddy >/dev/null 2>&1; then
     apt-get update
     apt-get install -y caddy
 fi
-# Per-instance drop-in dir, owned by the daemon user so bind-domain can write it.
+# Per-instance drop-in dir, owned by the daemon user so `domain bind` can write it.
 install -d -o khsvm -g khsvm -m 0755 /etc/caddy/khsvm
 # Ensure the main Caddyfile imports the drop-in dir (idempotent).
 touch /etc/caddy/Caddyfile
@@ -124,7 +124,7 @@ systemctl reload caddy 2>/dev/null || true
 
 # ── Cockpit: host admin UI, localhost-only behind Caddy ──────────────────────
 # Bound to 127.0.0.1:9090 with TLS off — Caddy is the sole public front
-# (kh-svm bind-admin-domain), same posture as instances. --no-install-recommends
+# (kh-svm domain bind-admin), same posture as instances. --no-install-recommends
 # keeps NetworkManager/packagekit off a server that manages its own networking.
 section "Installing Cockpit (admin UI)"
 apt-get install -y --no-install-recommends cockpit
