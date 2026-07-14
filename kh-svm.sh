@@ -6,7 +6,7 @@
 # Public entry point for the private kh-svm. Synced automatically to the public
 # KH-Project-Solutions/bootstrap repo — edit here, not there. Prompts for a KH-ServiceBot PAT
 # (repo scope) to pull the private release binary; it's then persisted on the
-# host via `kh-svm set-gh-token` (obfuscated, khsvm-only file) so deploy/update
+# host via `kh-svm daemon set-auth-token` (obfuscated, khsvm-only file) so deploy/update
 # and the Cockpit plugin work without re-prompting.
 # For unattended runs, pre-set KH_SVM_PAT in the environment to skip the prompt.
 set -euo pipefail
@@ -160,7 +160,7 @@ systemctl try-restart cockpit.service 2>/dev/null || true
 
 # kh-svm Cockpit plugin, from the same release as the binary (static files —
 # Cockpit picks them up on page load, no restart). Absent on pre-plugin
-# releases; `kh-svm upgrade-daemon` refreshes it alongside the binary.
+# releases; `kh-svm daemon upgrade` refreshes it alongside the binary.
 PLUGIN_ID=$(jq -r '.assets[] | select(.name=="khsvm-cockpit.tar.gz") | .id' <<<"$RELEASE_JSON")
 if [[ -n "$PLUGIN_ID" && "$PLUGIN_ID" != "null" ]]; then
     rm -rf /usr/share/cockpit/khsvm
@@ -187,7 +187,7 @@ User=khsvm
 Group=khsvm
 RuntimeDirectory=khsvm
 RuntimeDirectoryMode=0755
-ExecStart=${INSTALL_PATH} daemon
+ExecStart=${INSTALL_PATH} daemon run
 Restart=on-failure
 
 [Install]
@@ -210,8 +210,8 @@ done
 # daemon (running as khsvm) so the file lands khsvm-owned; the chown covers the
 # in-process fallback (root-owned would be unreadable to the daemon).
 section "Storing the GitHub token"
-KH_SVM_PAT="$KH_SVM_PAT" "$INSTALL_PATH" set-gh-token \
-    || warn "set-gh-token failed — store it later: kh-svm set-gh-token"
+KH_SVM_PAT="$KH_SVM_PAT" "$INSTALL_PATH" daemon set-auth-token \
+    || warn "set-auth-token failed — store it later: kh-svm daemon set-auth-token"
 chown khsvm:khsvm /var/lib/khsvm/.ghtoken 2>/dev/null || true
 
 ok "Host provisioned. kh-svm installed at ${INSTALL_PATH}; khsvmd running."
@@ -225,12 +225,12 @@ if [[ -r /dev/tty && -z "${KH_SVM_SKIP_DEPLOY:-}" ]]; then
     read -r ans < /dev/tty || ans=""
     case "${ans:-Y}" in
         [Nn]*) : ;;
-        *) "$INSTALL_PATH" deploy --interactive < /dev/tty \
-               || warn "deploy didn't complete — rerun later: kh-svm deploy --interactive" ;;
+        *) "$INSTALL_PATH" instance deploy --interactive < /dev/tty \
+               || warn "deploy didn't complete — rerun later: kh-svm instance deploy --interactive" ;;
     esac
 fi
 
 if [[ "$TARGET_USER" != "root" ]]; then
     warn "Log out and back in (or: newgrp docker) so '${TARGET_USER}' can use docker + kh-svm."
 fi
-echo "  Next: kh-svm doctor && kh-svm deploy --interactive" >&2
+echo "  Next: kh-svm doctor && kh-svm instance deploy --interactive" >&2
