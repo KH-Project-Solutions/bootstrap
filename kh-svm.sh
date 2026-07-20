@@ -35,7 +35,7 @@ fi
 # where stdin is the script itself.
 if [[ -z "${KH_SVM_PAT:-}" ]]; then
     if [[ -r /dev/tty ]]; then
-        read -rsp "KH-ServiceBot PAT (repo scope): " KH_SVM_PAT < /dev/tty
+        read -rsp "KH-ServiceBot PAT: " KH_SVM_PAT < /dev/tty
         echo >&2
     fi
 fi
@@ -142,7 +142,7 @@ install -d /etc/systemd/system/cockpit.service.d
 cat > /etc/systemd/system/cockpit.service.d/khsvm.conf <<EOF
 [Service]
 ExecStart=
-ExecStart=${WS_BIN} --no-tls
+ExecStart=${WS_BIN} --no-tls --address=127.0.0.1
 EOF
 # Trust Caddy's forwarded proto/IP so origin checks and logs work under the
 # https admin domain. Written once — don't clobber operator edits on rerun.
@@ -155,8 +155,15 @@ ForwardedForHeader = X-Forwarded-For
 EOF
 fi
 systemctl daemon-reload
+# Only ever touch the socket — cockpit-ws's --address/--port are ignored under
+# socket activation (cockpit-ws(8)), so restarting cockpit.service directly
+# makes it bind its own "all addresses" socket instead, which dies with
+# "Address family not supported by protocol" on IPv6-disabled hosts. Stopping
+# the service and restarting the socket lets systemd re-activate it on demand
+# with the new drop-in.
+systemctl stop cockpit.service 2>/dev/null || true
 systemctl enable --now cockpit.socket
-systemctl try-restart cockpit.service 2>/dev/null || true
+systemctl restart cockpit.socket
 
 # kh-svm Cockpit plugin, from the same release as the binary (static files —
 # Cockpit picks them up on page load, no restart). Absent on pre-plugin
@@ -255,36 +262,16 @@ if [[ -r /dev/tty && -z "${KH_SVM_SKIP_DEPLOY:-}" ]]; then
         *) warn "unrecognised choice — skipping project setup" ;;
     esac
 
-    # Standard domain pattern — a bootstrap-only convenience, not a kh-svm
-    # subcommand of its own: admin.<domain> -> Cockpit, <domain> (naked) ->
-    # production, staging.<domain> -> staging. A one-off or non-standard
-    # binding is still plain `kh-svm domain bind <instance> <domain>`.
-    printf '\n%sBind the standard domain pattern now?%s (base domain, blank to skip): ' \
+    # Only the admin (Cockpit) domain — the project/instance flow above already
+    # chains into kh-svm's own per-instance "bind a public domain now?" offer
+    # (offer_bind_domain in main.rs), so binding production/staging here too
+    # would just ask twice.
+    printf '\n%sBind the Cockpit admin domain now?%s (blank to skip): ' \
         "$C_STEP" "$C_RESET" > /dev/tty
-    read -r base_domain < /dev/tty || base_domain=""
-    if [[ -n "$base_domain" ]]; then
-        "$INSTALL_PATH" domain bind-admin "admin.${base_domain}" \
-            || warn "bind-admin failed — rerun later: kh-svm domain bind-admin admin.${base_domain}"
-        instances_json=$("$INSTALL_PATH" instance list --json 2>/dev/null || echo '[]')
-        # Only auto-picks the production instance when it's the sole one on the
-        # host — a host with several projects needs the operator to say which.
-        prod=$(jq -r '[.[] | select(.kind=="production")]
-                       | if length==1 then .[0].name else empty end' <<<"$instances_json")
-        if [[ -z "$prod" ]]; then
-            printf 'Production instance to bind %s to (blank to skip): ' "$base_domain" > /dev/tty
-            read -r prod < /dev/tty || prod=""
-        fi
-        if [[ -n "$prod" ]]; then
-            "$INSTALL_PATH" domain bind "$prod" "$base_domain" \
-                || warn "bind $prod failed — rerun later: kh-svm domain bind $prod $base_domain"
-            proj=$(jq -r --arg n "$prod" '.[] | select(.name==$n) | .project' <<<"$instances_json")
-            stage=$(jq -r --arg p "$proj" \
-                '.[] | select(.project==$p and .kind=="staging") | .name' <<<"$instances_json" | head -n1)
-            if [[ -n "$stage" ]]; then
-                "$INSTALL_PATH" domain bind "$stage" "staging.${base_domain}" \
-                    || warn "bind $stage failed — rerun later: kh-svm domain bind $stage staging.${base_domain}"
-            fi
-        fi
+    read -r admin_domain < /dev/tty || admin_domain=""
+    if [[ -n "$admin_domain" ]]; then
+        "$INSTALL_PATH" domain bind-admin "$admin_domain" \
+            || warn "bind-admin failed — rerun later: kh-svm domain bind-admin $admin_domain"
     fi
 fi
 
