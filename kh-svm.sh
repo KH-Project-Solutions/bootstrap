@@ -273,21 +273,44 @@ if [[ -r /dev/tty && -z "${KH_SVM_SKIP_DEPLOY:-}" ]]; then
     fi
 fi
 
-# Cockpit logs in via local PAM, which needs a real password — cloud images
-# typically leave the sudo user key-auth-only (locked/no password in shadow),
-# which silently fails every Cockpit login attempt. Catch it here.
+# Cockpit logs in via local PAM, which needs a real password. Cloud images
+# (Debian/Ubuntu, most providers) ship the sudo user key-auth-only via
+# cloud-init's `lock_passwd: true` in /etc/cloud/cloud.cfg — passwording that
+# account fights the image's intended posture, so give Cockpit a separate
+# "administrator" account instead of touching it. A manually-created (non
+# cloud-init) sudo user has no such marker and is fine to password directly.
+LOGIN_USER="$TARGET_USER"
+if [[ -f /etc/cloud/cloud.cfg ]] && grep -qi 'lock_passwd:[[:space:]]*true' /etc/cloud/cloud.cfg; then
+    LOGIN_USER=administrator
+    if ! id "$LOGIN_USER" &>/dev/null; then
+        useradd -m -s /bin/bash -G sudo,docker "$LOGIN_USER"
+    fi
+fi
+
 if [[ -r /dev/tty ]]; then
-    pw_status=$(passwd -S "$TARGET_USER" 2>/dev/null | awk '{print $2}')
+    pw_status=$(passwd -S "$LOGIN_USER" 2>/dev/null | awk '{print $2}' || true)
     if [[ "$pw_status" != "P" ]]; then
-        printf '\n%s%s has no usable login password — Cockpit needs one to sign in.%s\n' \
-            "$C_WARN" "$TARGET_USER" "$C_RESET" > /dev/tty
+        if [[ "$LOGIN_USER" != "$TARGET_USER" ]]; then
+            printf '\n%s%s is key-login only by design — created "%s" for Cockpit instead.%s\n' \
+                "$C_WARN" "$TARGET_USER" "$LOGIN_USER" "$C_RESET" > /dev/tty
+        else
+            printf '\n%s%s has no usable login password — Cockpit needs one to sign in.%s\n' \
+                "$C_WARN" "$LOGIN_USER" "$C_RESET" > /dev/tty
+        fi
         printf 'Generate one now? [Y/n]: ' > /dev/tty
-        read -r gen_pw < /dev/tty || gen_pw=""
+        gen_pw=""
+        read -r gen_pw < /dev/tty || true
         if [[ ! "$gen_pw" =~ ^[Nn] ]]; then
-            NEW_PW=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
-            echo "${TARGET_USER}:${NEW_PW}" | chpasswd
-            ok "Password set for ${TARGET_USER}: ${NEW_PW}"
-            warn "Save this now — it won't be shown again. Change it anytime with: passwd"
+            # `head -c` cuts the pipe once it has enough bytes, SIGPIPE-ing tr —
+            # under pipefail that's a "failure" that set -e would otherwise abort
+            # the whole script on; `; true` absorbs it (expected, not an error).
+            NEW_PW=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20; true)
+            if echo "${LOGIN_USER}:${NEW_PW}" | chpasswd; then
+                ok "Password set for ${LOGIN_USER}: ${NEW_PW}"
+                warn "Save this now — it won't be shown again. Change it anytime with: passwd ${LOGIN_USER}"
+            else
+                warn "Couldn't set a password automatically — set one manually with: passwd ${LOGIN_USER}"
+            fi
         fi
     fi
 fi
