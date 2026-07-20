@@ -123,9 +123,9 @@ systemctl enable --now caddy
 systemctl reload caddy 2>/dev/null || true
 
 # ── Cockpit: host admin UI, localhost-only behind Caddy ──────────────────────
-# Bound to 127.0.0.1:9090 with TLS off — Caddy is the sole public front
-# (kh-svm domain bind-admin), same posture as instances. --no-install-recommends
-# keeps NetworkManager/packagekit off a server that manages its own networking.
+# Bound to 127.0.0.1:9090; Caddy is the sole public front (kh-svm domain
+# bind-admin), same posture as instances. --no-install-recommends keeps
+# NetworkManager/packagekit off a server that manages its own networking.
 section "Installing Cockpit (admin UI)"
 apt-get install -y --no-install-recommends cockpit
 install -d /etc/systemd/system/cockpit.socket.d
@@ -134,22 +134,20 @@ cat > /etc/systemd/system/cockpit.socket.d/khsvm.conf <<'EOF'
 ListenStream=
 ListenStream=127.0.0.1:9090
 EOF
-# Plain HTTP on loopback; Caddy terminates TLS. cockpit-ws's path varies across
-# releases, so resolve it.
-WS_BIN=/usr/libexec/cockpit-ws
-[[ -x $WS_BIN ]] || WS_BIN=/usr/lib/cockpit/cockpit-ws
-install -d /etc/systemd/system/cockpit.service.d
-cat > /etc/systemd/system/cockpit.service.d/khsvm.conf <<EOF
-[Service]
-ExecStart=
-ExecStart=${WS_BIN} --no-tls --address=127.0.0.1
-EOF
-# Trust Caddy's forwarded proto/IP so origin checks and logs work under the
-# https admin domain. Written once — don't clobber operator edits on rerun.
+# Plain HTTP on loopback; Caddy terminates TLS. This is done via cockpit.conf's
+# AllowUnencrypted, not a cockpit.service ExecStart override (an earlier
+# revision hand-rolled `cockpit-ws --no-tls --address=...`, which pulls
+# cockpit-ws off the normal socket-activated path — it then never negotiates
+# /run/cockpit/session correctly and every login fails with a permission/socket
+# error, even though the process itself starts fine). Trust Caddy's forwarded
+# proto/IP too, so origin checks and logs work under the https admin domain.
+# Written once — don't clobber operator edits on rerun.
+rm -f /etc/systemd/system/cockpit.service.d/khsvm.conf
 if [[ ! -e /etc/cockpit/cockpit.conf ]]; then
     install -d /etc/cockpit
     cat > /etc/cockpit/cockpit.conf <<'EOF'
 [WebService]
+AllowUnencrypted = true
 ProtocolHeader = X-Forwarded-Proto
 ForwardedForHeader = X-Forwarded-For
 EOF
@@ -272,6 +270,25 @@ if [[ -r /dev/tty && -z "${KH_SVM_SKIP_DEPLOY:-}" ]]; then
     if [[ -n "$admin_domain" ]]; then
         "$INSTALL_PATH" domain bind-admin "$admin_domain" \
             || warn "bind-admin failed — rerun later: kh-svm domain bind-admin $admin_domain"
+    fi
+fi
+
+# Cockpit logs in via local PAM, which needs a real password — cloud images
+# typically leave the sudo user key-auth-only (locked/no password in shadow),
+# which silently fails every Cockpit login attempt. Catch it here.
+if [[ -r /dev/tty ]]; then
+    pw_status=$(passwd -S "$TARGET_USER" 2>/dev/null | awk '{print $2}')
+    if [[ "$pw_status" != "P" ]]; then
+        printf '\n%s%s has no usable login password — Cockpit needs one to sign in.%s\n' \
+            "$C_WARN" "$TARGET_USER" "$C_RESET" > /dev/tty
+        printf 'Generate one now? [Y/n]: ' > /dev/tty
+        read -r gen_pw < /dev/tty || gen_pw=""
+        if [[ ! "$gen_pw" =~ ^[Nn] ]]; then
+            NEW_PW=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
+            echo "${TARGET_USER}:${NEW_PW}" | chpasswd
+            ok "Password set for ${TARGET_USER}: ${NEW_PW}"
+            warn "Save this now — it won't be shown again. Change it anytime with: passwd"
+        fi
     fi
 fi
 
