@@ -205,7 +205,7 @@ for _ in $(seq 1 25); do
     sleep 0.2
 done
 
-# Persist the PAT on the host (kh-svm set-gh-token → /var/lib/khsvm/.ghtoken):
+# Persist the PAT on the host (kh-svm daemon set-auth-token → /var/lib/khsvm/.ghtoken):
 # deploy/update and the Cockpit plugin then work without a tty. Goes through the
 # daemon (running as khsvm) so the file lands khsvm-owned; the chown covers the
 # in-process fallback (root-owned would be unreadable to the daemon).
@@ -216,21 +216,79 @@ chown khsvm:khsvm /var/lib/khsvm/.ghtoken 2>/dev/null || true
 
 ok "Host provisioned. kh-svm installed at ${INSTALL_PATH}; khsvmd running."
 
-# Offer the guided first deploy right here (we agreed the bootstrap should hand
-# straight off to it). Runs as root — root reaches the group-docker socket, and
-# </dev/tty gives the interactive picker + PAT prompt a real terminal even though
+# Offer the guided first project right here (we agreed the bootstrap should
+# hand straight off to it). Runs as root — root reaches the group-docker
+# socket, and </dev/tty gives every prompt below a real terminal even though
 # this script arrived over `curl | bash`. Skippable with KH_SVM_SKIP_DEPLOY=1.
+# `project new`/`clone`/`copy` each already chain into kh-svm's own "add a
+# production instance now? then staging?" offers — this menu only picks which
+# of the three starts that chain.
 if [[ -r /dev/tty && -z "${KH_SVM_SKIP_DEPLOY:-}" ]]; then
-    printf '\n%sDeploy a project now?%s [Y/n] ' "$C_STEP" "$C_RESET" > /dev/tty
-    read -r ans < /dev/tty || ans=""
-    case "${ans:-Y}" in
-        [Nn]*) : ;;
-        *) "$INSTALL_PATH" instance deploy --interactive < /dev/tty \
-               || warn "deploy didn't complete — rerun later: kh-svm instance deploy --interactive" ;;
+    printf '\n%sSet up a project now?%s\n' "$C_STEP" "$C_RESET" > /dev/tty
+    printf '  1) Create a project\n  2) Clone a project\n  3) Copy a project\n  x) Exit\n' > /dev/tty
+    printf 'Choice [1]: ' > /dev/tty
+    read -r choice < /dev/tty || choice=""
+    case "${choice:-1}" in
+        1)
+            printf 'New project name: ' > /dev/tty
+            read -r name < /dev/tty || name=""
+            if [[ -n "$name" ]]; then
+                "$INSTALL_PATH" project new "$name" < /dev/tty \
+                    || warn "project new didn't complete — rerun later: kh-svm project new <name>"
+            fi
+            ;;
+        2)
+            "$INSTALL_PATH" project clone < /dev/tty \
+                || warn "project clone didn't complete — rerun later: kh-svm project clone"
+            ;;
+        3)
+            printf 'Source project to copy from: ' > /dev/tty
+            read -r src < /dev/tty || src=""
+            printf 'New project name: ' > /dev/tty
+            read -r name < /dev/tty || name=""
+            if [[ -n "$src" && -n "$name" ]]; then
+                "$INSTALL_PATH" project copy "$src" "$name" < /dev/tty \
+                    || warn "project copy didn't complete — rerun later: kh-svm project copy <source> <name>"
+            fi
+            ;;
+        x|X) : ;;
+        *) warn "unrecognised choice — skipping project setup" ;;
     esac
+
+    # Standard domain pattern — a bootstrap-only convenience, not a kh-svm
+    # subcommand of its own: admin.<domain> -> Cockpit, <domain> (naked) ->
+    # production, staging.<domain> -> staging. A one-off or non-standard
+    # binding is still plain `kh-svm domain bind <instance> <domain>`.
+    printf '\n%sBind the standard domain pattern now?%s (base domain, blank to skip): ' \
+        "$C_STEP" "$C_RESET" > /dev/tty
+    read -r base_domain < /dev/tty || base_domain=""
+    if [[ -n "$base_domain" ]]; then
+        "$INSTALL_PATH" domain bind-admin "admin.${base_domain}" \
+            || warn "bind-admin failed — rerun later: kh-svm domain bind-admin admin.${base_domain}"
+        instances_json=$("$INSTALL_PATH" instance list --json 2>/dev/null || echo '[]')
+        # Only auto-picks the production instance when it's the sole one on the
+        # host — a host with several projects needs the operator to say which.
+        prod=$(jq -r '[.[] | select(.kind=="production")]
+                       | if length==1 then .[0].name else empty end' <<<"$instances_json")
+        if [[ -z "$prod" ]]; then
+            printf 'Production instance to bind %s to (blank to skip): ' "$base_domain" > /dev/tty
+            read -r prod < /dev/tty || prod=""
+        fi
+        if [[ -n "$prod" ]]; then
+            "$INSTALL_PATH" domain bind "$prod" "$base_domain" \
+                || warn "bind $prod failed — rerun later: kh-svm domain bind $prod $base_domain"
+            proj=$(jq -r --arg n "$prod" '.[] | select(.name==$n) | .project' <<<"$instances_json")
+            stage=$(jq -r --arg p "$proj" \
+                '.[] | select(.project==$p and .kind=="staging") | .name' <<<"$instances_json" | head -n1)
+            if [[ -n "$stage" ]]; then
+                "$INSTALL_PATH" domain bind "$stage" "staging.${base_domain}" \
+                    || warn "bind $stage failed — rerun later: kh-svm domain bind $stage staging.${base_domain}"
+            fi
+        fi
+    fi
 fi
 
 if [[ "$TARGET_USER" != "root" ]]; then
     warn "Log out and back in (or: newgrp docker) so '${TARGET_USER}' can use docker + kh-svm."
 fi
-echo "  Next: kh-svm doctor && kh-svm instance deploy --interactive" >&2
+echo "  Next: kh-svm doctor && kh-svm project new <name>" >&2
