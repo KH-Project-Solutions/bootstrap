@@ -219,6 +219,42 @@ KH_SVM_PAT="$KH_SVM_PAT" "$INSTALL_PATH" daemon set-auth-token \
     || warn "set-auth-token failed — store it later: kh-svm daemon set-auth-token"
 chown khsvm:khsvm /var/lib/khsvm/.ghtoken 2>/dev/null || true
 
+# S3 backups: an offer, never a requirement — declining leaves a fully working
+# host with backups simply off. The bucket/region go in /var/lib/khsvm/config.toml
+# (`daemon config set`); the key pair goes in the 0600 .s3key (`daemon set-s3-key`),
+# which reads KH_SVM_S3_KEY from the environment so the secret never reaches argv.
+# Skip non-interactively with KH_SVM_SKIP_S3=1.
+if [[ -r /dev/tty && -z "${KH_SVM_SKIP_S3:-}" ]]; then
+    section "S3 backups"
+    printf 'Configure S3 backups now? [y/N]: ' > /dev/tty
+    read -r s3_choice < /dev/tty || s3_choice=""
+    if [[ "$s3_choice" =~ ^[Yy] ]]; then
+        printf 'bucket: ' > /dev/tty;   read -r s3_bucket < /dev/tty
+        printf 'region: ' > /dev/tty;   read -r s3_region < /dev/tty
+        printf 'endpoint (blank for AWS S3): ' > /dev/tty; read -r s3_endpoint < /dev/tty
+        read -rsp "access key id: "     s3_id     < /dev/tty; echo >&2
+        read -rsp "secret access key: " s3_secret < /dev/tty; echo >&2
+
+        if [[ -z "$s3_bucket" || -z "$s3_region" || -z "$s3_id" || -z "$s3_secret" ]]; then
+            warn "incomplete S3 setup — configure it later: kh-svm daemon config set --bucket <b> --region <r> && kh-svm daemon set-s3-key"
+        else
+            "$INSTALL_PATH" daemon config set --bucket "$s3_bucket" --region "$s3_region" \
+                --endpoint "$s3_endpoint" \
+                || warn "config set failed — rerun later: kh-svm daemon config set --bucket <b> --region <r>"
+            KH_SVM_S3_KEY="${s3_id}:${s3_secret}" "$INSTALL_PATH" daemon set-s3-key \
+                || warn "set-s3-key failed — store it later: kh-svm daemon set-s3-key"
+            chown khsvm:khsvm /var/lib/khsvm/.s3key 2>/dev/null || true
+            # Prove the key can actually reach the bucket now, rather than at the
+            # first scheduled tick some night from now.
+            "$INSTALL_PATH" doctor > /dev/tty 2>&1 \
+                || warn "doctor reported problems — check the S3 line above"
+        fi
+        unset s3_id s3_secret
+    else
+        printf 'Skipped. Backups stay off until: kh-svm daemon config set --bucket <b> --region <r>\n' > /dev/tty
+    fi
+fi
+
 ok "Host provisioned. kh-svm installed at ${INSTALL_PATH}; khsvmd running."
 
 # Offer the guided first project right here (we agreed the bootstrap should
