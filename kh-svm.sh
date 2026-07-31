@@ -56,7 +56,31 @@ fi
 
 section "Installing base packages (apt)"
 apt-get update
-apt-get install -y ca-certificates curl git jq
+apt-get install -y ca-certificates curl wget git jq
+
+# ── firewalld: default-deny host firewall ────────────────────────────────────
+# Installed and started before Docker: dockerd inserts its own iptables/
+# nftables rules for container NAT at startup, and doing that against an
+# already-initialized firewalld ruleset is the documented way to avoid
+# firewalld silently wiping Docker's chains on its own init. The docker.service
+# drop-in below pins that same ordering on every future boot, regardless of
+# section order here.
+section "Installing firewalld"
+apt-get install -y firewalld
+systemctl enable --now firewalld
+firewall-cmd --permanent --add-service=ssh
+firewall-cmd --permanent --add-service=http
+firewall-cmd --permanent --add-service=https
+firewall-cmd --reload
+# Cockpit needs no rule of its own — it's loopback-only (127.0.0.1:9090)
+# behind Caddy, same posture as every instance; only Caddy's 80/443 are public.
+install -d /etc/systemd/system/docker.service.d
+cat > /etc/systemd/system/docker.service.d/firewalld-order.conf <<'EOF'
+[Unit]
+After=firewalld.service
+Wants=firewalld.service
+EOF
+systemctl daemon-reload
 
 # Docker engine via the official convenience script (idempotent — skips if present).
 section "Installing Docker"
@@ -119,8 +143,70 @@ touch /etc/caddy/Caddyfile
 if ! grep -q '^import /etc/caddy/khsvm/' /etc/caddy/Caddyfile; then
     echo 'import /etc/caddy/khsvm/*.caddy' >> /etc/caddy/Caddyfile
 fi
+# Named, module-restricted access logger (JSON, access-only — Caddy's own
+# runtime/TLS/admin lines stay off it via `include`) so fail2ban's caddy-auth
+# filter below only ever sees real requests. Every per-instance site file
+# (`caddy_site` in core/caddy.rs) references it as `log khsvm-access`; Caddy
+# logs nothing by default otherwise. Global options blocks must be the very
+# first thing in the Caddyfile, so this is prepended, not appended like the
+# import line above.
+install -d -o caddy -g caddy -m 0750 /var/log/caddy
+if ! grep -q 'khsvm-access' /etc/caddy/Caddyfile; then
+    CADDY_TMP=$(mktemp)
+    cat > "$CADDY_TMP" <<'EOF'
+{
+	log khsvm-access {
+		output file /var/log/caddy/access.log
+		format json
+		include http.log.access.khsvm-access
+	}
+}
+
+EOF
+    cat /etc/caddy/Caddyfile >> "$CADDY_TMP"
+    # mktemp's own mode (0600, root-only) would otherwise replace the
+    # package's world-readable conffile — caddy runs as user `caddy`, so it
+    # would fail closed with "permission denied" reading its own config.
+    chmod 644 "$CADDY_TMP"
+    mv "$CADDY_TMP" /etc/caddy/Caddyfile
+fi
 systemctl enable --now caddy
 systemctl reload caddy 2>/dev/null || true
+
+# ── fail2ban: brute-force protection (SSH + every Caddy-fronted login) ───────
+# One Caddy-log jail covers Cockpit and every Odoo instance — both are always
+# served through Caddy (kh-svm's `domain bind`/`bind-admin`), so there's no
+# separate per-app jail to maintain. Threshold is deliberately high: this
+# catches brute-force bursts, not a real user who mistyped a password a few
+# times — a low maxretry here would just be a self-inflicted lockout generator.
+section "Installing fail2ban"
+apt-get install -y fail2ban
+cat > /etc/fail2ban/filter.d/caddy-auth.conf <<'EOF'
+[Definition]
+# Caddy's khsvm-access JSON log (one object per line): remote_ip sits inside
+# the "request" object, which always precedes the top-level "status" field.
+# "ts" is a Unix epoch float (e.g. 1785482787.1714542) — fail2ban's default
+# date detectors don't find it without a hint, and silently fall back to
+# wall-clock time for every match (noisy warnings, fragile findtime bucketing
+# on any backlog), so it's pinned explicitly here.
+datepattern = EPOCH
+failregex = ^\{.*"remote_ip":"<HOST>".*"status":(?:401|403|503)\b
+ignoreregex =
+EOF
+cat > /etc/fail2ban/jail.d/khsvm.local <<'EOF'
+[sshd]
+enabled = true
+
+[caddy-auth]
+enabled  = true
+filter   = caddy-auth
+logpath  = /var/log/caddy/access.log
+findtime = 10m
+maxretry = 20
+bantime  = 1h
+EOF
+systemctl enable --now fail2ban
+systemctl restart fail2ban
 
 # ── Cockpit: host admin UI, localhost-only behind Caddy ──────────────────────
 # Bound to 127.0.0.1:9090; Caddy is the sole public front (kh-svm domain
@@ -176,6 +262,28 @@ if [[ -n "$PLUGIN_ID" && "$PLUGIN_ID" != "null" ]]; then
 else
     warn "latest release has no khsvm-cockpit.tar.gz — Cockpit plugin skipped"
 fi
+
+# ── Cockpit companions: metrics history + file manager ───────────────────────
+section "Installing PCP (Cockpit metrics history)"
+apt-get install -y pcp
+systemctl enable --now pmcd pmlogger
+
+section "Installing cockpit-navigator"
+# Not in Debian's own repos (confirmed absent from `apt-cache search cockpit`
+# on Debian 13) — ships from 45Drives' own apt repo instead, the same pattern
+# already used for Caddy above. Their setup script needs wget (installed with
+# the base packages).
+if ! dpkg -s cockpit-navigator >/dev/null 2>&1; then
+    curl -fsSL https://repo.45drives.com/setup -o /tmp/45drives-setup.sh
+    bash /tmp/45drives-setup.sh
+    rm -f /tmp/45drives-setup.sh
+    apt-get install -y cockpit-navigator
+fi
+# cockpit-selinux / cockpit-session-recording, from the original wishlist:
+# neither is packaged for Debian. SELinux isn't Debian's MAC (that's
+# AppArmor), and session-recording's tlog integration targets Fedora/RHEL's
+# Cockpit ecosystem — confirmed absent from Debian 13's repos. Skipped rather
+# than installing dead weight; revisit if 45Drives or Debian ever ship one.
 
 # systemd unit. RuntimeDirectory gives the daemon a writable /run/khsvm for its
 # socket; 0755 so the operator can traverse it, while the socket itself is
@@ -254,6 +362,23 @@ if [[ -r /dev/tty && -z "${KH_SVM_SKIP_S3:-}" ]]; then
         printf 'Skipped. Backups stay off until: kh-svm daemon config set --bucket <b> --region <r>\n' > /dev/tty
     fi
 fi
+
+# ── Patching hygiene: OS security updates + safe auto-restart ────────────────
+# Host-OS patching only — Odoo images are versioned and updated separately via
+# `instance update` (CLAUDE.md's update invariant); this never touches them.
+section "Installing unattended-upgrades"
+apt-get install -y unattended-upgrades
+systemctl enable --now unattended-upgrades.service
+
+section "Installing needrestart"
+apt-get install -y needrestart
+install -d /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/khsvm.conf <<'EOF'
+# Headless host — nothing will ever answer needrestart's interactive restart
+# prompt, so it would otherwise just queue silently. Restart flagged services
+# automatically instead.
+$nrconf{restart} = 'a';
+EOF
 
 ok "Host provisioned. kh-svm installed at ${INSTALL_PATH}; khsvmd running."
 
