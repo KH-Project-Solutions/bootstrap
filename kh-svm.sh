@@ -25,6 +25,27 @@ section() { printf '\n%s» %s%s\n' "$C_STEP" "$*" "$C_RESET" >&2; }
 ok()      { printf '%s✓ %s%s\n'   "$C_OK"   "$*" "$C_RESET" >&2; }
 warn()    { printf '%s! %s%s\n'   "$C_WARN" "$*" "$C_RESET" >&2; }
 
+# unattended-upgrades (installed below) or a concurrent cloud-init apt run can
+# hold dpkg's lock for a few minutes on a freshly booted host. Retry instead of
+# failing the whole bootstrap on a transient lock — apt-get's own exit code 100
+# covers both "lock held" and real package errors, so we just retry a few times
+# with a backoff rather than trying to distinguish them.
+apt_get() {
+    local attempt=1 max=10
+    while true; do
+        if command apt-get "$@"; then
+            return 0
+        fi
+        local status=$?
+        if (( attempt >= max )); then
+            return "$status"
+        fi
+        warn "apt_get $1 failed (dpkg lock busy?) — retrying in 10s (${attempt}/${max})"
+        attempt=$((attempt + 1))
+        sleep 10
+    done
+}
+
 if [[ $EUID -ne 0 ]]; then
     echo "This script must run as root — pipe it to sudo: … | sudo bash" >&2
     exit 1
@@ -55,8 +76,8 @@ if [[ "${ID:-}" != "debian" || "${VERSION_CODENAME:-}" != "trixie" ]]; then
 fi
 
 section "Installing base packages (apt)"
-apt-get update
-apt-get install -y ca-certificates curl wget git jq
+apt_get update
+apt_get install -y ca-certificates curl wget git jq
 
 # ── firewalld: default-deny host firewall ────────────────────────────────────
 # Installed and started before Docker: dockerd inserts its own iptables/
@@ -66,7 +87,7 @@ apt-get install -y ca-certificates curl wget git jq
 # drop-in below pins that same ordering on every future boot, regardless of
 # section order here.
 section "Installing firewalld"
-apt-get install -y firewalld
+apt_get install -y firewalld
 systemctl enable --now firewalld
 firewall-cmd --permanent --add-service=ssh
 firewall-cmd --permanent --add-service=http
@@ -128,13 +149,13 @@ install -d -o khsvm -g khsvm -m 0750 /var/lib/khsvm
 # that drop-in dir. The main Caddyfile just imports it.
 section "Installing Caddy (reverse proxy)"
 if ! command -v caddy >/dev/null 2>&1; then
-    apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+    apt_get install -y debian-keyring debian-archive-keyring apt-transport-https
     curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
         | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
     curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
         > /etc/apt/sources.list.d/caddy-stable.list
-    apt-get update
-    apt-get install -y caddy
+    apt_get update
+    apt_get install -y caddy
 fi
 # Per-instance drop-in dir, owned by the daemon user so `domain bind` can write it.
 install -d -o khsvm -g khsvm -m 0755 /etc/caddy/khsvm
@@ -180,7 +201,7 @@ systemctl reload caddy 2>/dev/null || true
 # catches brute-force bursts, not a real user who mistyped a password a few
 # times — a low maxretry here would just be a self-inflicted lockout generator.
 section "Installing fail2ban"
-apt-get install -y fail2ban
+apt_get install -y fail2ban
 cat > /etc/fail2ban/filter.d/caddy-auth.conf <<'EOF'
 [Definition]
 # Caddy's khsvm-access JSON log (one object per line): remote_ip sits inside
@@ -213,7 +234,7 @@ systemctl restart fail2ban
 # bind-admin), same posture as instances. --no-install-recommends keeps
 # NetworkManager/packagekit off a server that manages its own networking.
 section "Installing Cockpit (admin UI)"
-apt-get install -y --no-install-recommends cockpit
+apt_get install -y --no-install-recommends cockpit
 install -d /etc/systemd/system/cockpit.socket.d
 cat > /etc/systemd/system/cockpit.socket.d/khsvm.conf <<'EOF'
 [Socket]
@@ -265,7 +286,7 @@ fi
 
 # ── Cockpit companions: metrics history + file manager ───────────────────────
 section "Installing PCP (Cockpit metrics history)"
-apt-get install -y pcp
+apt_get install -y pcp
 systemctl enable --now pmcd pmlogger
 
 section "Installing cockpit-navigator"
@@ -277,7 +298,7 @@ if ! dpkg -s cockpit-navigator >/dev/null 2>&1; then
     curl -fsSL https://repo.45drives.com/setup -o /tmp/45drives-setup.sh
     bash /tmp/45drives-setup.sh
     rm -f /tmp/45drives-setup.sh
-    apt-get install -y cockpit-navigator
+    apt_get install -y cockpit-navigator
 fi
 # cockpit-selinux / cockpit-session-recording, from the original wishlist:
 # neither is packaged for Debian. SELinux isn't Debian's MAC (that's
@@ -367,11 +388,11 @@ fi
 # Host-OS patching only — Odoo images are versioned and updated separately via
 # `instance update` (CLAUDE.md's update invariant); this never touches them.
 section "Installing unattended-upgrades"
-apt-get install -y unattended-upgrades
+apt_get install -y unattended-upgrades
 systemctl enable --now unattended-upgrades.service
 
 section "Installing needrestart"
-apt-get install -y needrestart
+apt_get install -y needrestart
 install -d /etc/needrestart/conf.d
 cat > /etc/needrestart/conf.d/khsvm.conf <<'EOF'
 # Headless host — nothing will ever answer needrestart's interactive restart
@@ -391,10 +412,19 @@ ok "Host provisioned. kh-svm installed at ${INSTALL_PATH}; khsvmd running."
 # of the three starts that chain.
 if [[ -r /dev/tty && -z "${KH_SVM_SKIP_DEPLOY:-}" ]]; then
     printf '\n%sSet up a project now?%s\n' "$C_STEP" "$C_RESET" > /dev/tty
-    printf '  1) Create a project\n  2) Clone a project\n  3) Copy a project\n  x) Exit\n' > /dev/tty
-    printf 'Choice [1]: ' > /dev/tty
-    read -r choice < /dev/tty || choice=""
-    case "${choice:-1}" in
+    # bash's own `select` (not a plain `read`) so a stray/empty line in the tty
+    # buffer just re-displays the menu instead of silently falling through to a
+    # default choice and having the next real keystroke land on the wrong prompt.
+    PS3="Choice: "
+    choice=""
+    select _opt in "Create a project" "Clone a project" "Copy a project" "Exit"; do
+        case "$REPLY" in
+            1|2|3) choice="$REPLY"; break ;;
+            4|x|X) choice="x"; break ;;
+            *) printf 'Invalid choice.\n' > /dev/tty ;;
+        esac
+    done < /dev/tty > /dev/tty
+    case "$choice" in
         1)
             printf 'New project name: ' > /dev/tty
             read -r name < /dev/tty || name=""
@@ -417,8 +447,7 @@ if [[ -r /dev/tty && -z "${KH_SVM_SKIP_DEPLOY:-}" ]]; then
                     || warn "project copy didn't complete — rerun later: kh-svm project copy <source> <name>"
             fi
             ;;
-        x|X) : ;;
-        *) warn "unrecognised choice — skipping project setup" ;;
+        x) : ;;
     esac
 
     # Only the admin (Cockpit) domain — the project/instance flow above already
