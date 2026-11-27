@@ -329,7 +329,10 @@ WantedBy=multi-user.target
 UNIT
 
 systemctl daemon-reload
-systemctl enable --now khsvmd
+# Restart, not `enable --now`: on a rerun the daemon is already up and would
+# keep serving the binary just replaced above.
+systemctl enable khsvmd
+systemctl restart khsvmd
 
 # Wait briefly for the daemon socket so the deploy below goes through the daemon
 # (as khsvm), not the root in-process fallback (which would create khsvm-owned
@@ -338,6 +341,12 @@ for _ in $(seq 1 25); do
     [[ -S /run/khsvm/khsvmd.sock ]] && break
     sleep 0.2
 done
+
+# The installed binary's one-time fixups (a no-op on a fresh host, where it
+# just records them as applied). Rerunning the bootstrap is an upgrade path too.
+section "Applying migrations"
+"$INSTALL_PATH" daemon migrate \
+    || warn "migrations failed — rerun later: kh-svm daemon migrate"
 
 # Persist the PAT on the host (kh-svm daemon set-auth-token → /var/lib/khsvm/.ghtoken):
 # deploy/update and the Cockpit plugin then work without a tty. Goes through the
