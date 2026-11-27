@@ -514,7 +514,57 @@ if [[ -r /dev/tty ]]; then
     fi
 fi
 
+# ── Cockpit TOTP (2FA) ───────────────────────────────────────────────────────
+# A second factor on the Cockpit login only — sshd and every other PAM service
+# stay untouched, so SSH keys remain the way back in. `nullok` lets anyone
+# without an enrolled secret through on password alone: adding the line can
+# never lock a user out. Once every Cockpit user has enrolled, rerun with
+# KH_SVM_TOTP_ENFORCE=1 to drop `nullok` and require TOTP for all. PAM rereads
+# the file on every login, so nothing restarts.
+section "Cockpit TOTP (2FA)"
+apt_get install -y libpam-google-authenticator
+COCKPIT_PAM=/etc/pam.d/cockpit
+backup_cockpit_pam() { cp -a "$COCKPIT_PAM" "${COCKPIT_PAM}.bak.$(date +%Y%m%d%H%M%S)"; }
+if ! grep -q 'pam_google_authenticator' "$COCKPIT_PAM"; then
+    # After the password check, never a guessed spot: anywhere else could put
+    # TOTP before the password prompt or outside the auth stack.
+    if ! grep -Eq '^auth[[:space:]]+substack[[:space:]]+common-auth' "$COCKPIT_PAM"; then
+        echo "No 'auth substack common-auth' line in ${COCKPIT_PAM} — refusing to place the TOTP line." >&2
+        exit 1
+    fi
+    backup_cockpit_pam
+    sed -i -E '/^auth[[:space:]]+substack[[:space:]]+common-auth/a auth       required     pam_google_authenticator.so nullok' \
+        "$COCKPIT_PAM"
+fi
+if [[ -n "${KH_SVM_TOTP_ENFORCE:-}" ]] && grep -Eq 'pam_google_authenticator\.so.*nullok' "$COCKPIT_PAM"; then
+    backup_cockpit_pam
+    sed -i -E '/pam_google_authenticator\.so/ s/[[:space:]]+nullok\b//' "$COCKPIT_PAM"
+    warn "TOTP now enforced — Cockpit users without ~/.google_authenticator can no longer log in"
+fi
+
+# Enroll the Cockpit login user (root is in /etc/cockpit/disallowed-users, so
+# never it). Runs as that user so the secret lands in their home, owned by
+# them. KH_SVM_TOTP_USER overrides who; KH_SVM_SKIP_TOTP=1 skips enrollment.
+TOTP_USER="${KH_SVM_TOTP_USER:-$LOGIN_USER}"
+TOTP_ARGS=(-t -d -f -r 3 -R 30 -w 3)
+TOTP_HOME=$(getent passwd "$TOTP_USER" | cut -d: -f6 || true)
+if [[ "$TOTP_USER" == "root" ]]; then
+    warn "Cockpit refuses root — no TOTP user to enroll (set KH_SVM_TOTP_USER)"
+elif [[ -z "$TOTP_HOME" ]]; then
+    warn "TOTP user '${TOTP_USER}' doesn't exist — enrollment skipped"
+elif [[ -e "${TOTP_HOME}/.google_authenticator" ]]; then
+    ok "${TOTP_USER} already enrolled in Cockpit TOTP"
+elif [[ -r /dev/tty && -z "${KH_SVM_SKIP_TOTP:-}" ]]; then
+    printf '\n%sScan this QR code into an authenticator app and save the scratch codes — they are shown once.%s\n' \
+        "$C_STEP" "$C_RESET" > /dev/tty
+    sudo -u "$TOTP_USER" -H google-authenticator "${TOTP_ARGS[@]}" < /dev/tty > /dev/tty 2>&1 \
+        || warn "TOTP enrollment failed — rerun later as ${TOTP_USER}: google-authenticator ${TOTP_ARGS[*]}"
+else
+    warn "${TOTP_USER} not enrolled — Cockpit stays password-only for them until they run: google-authenticator ${TOTP_ARGS[*]}"
+fi
+
 if [[ "$TARGET_USER" != "root" ]]; then
     warn "Log out and back in (or: newgrp docker) so '${TARGET_USER}' can use docker + kh-svm."
 fi
+warn "Before logging out: test the Cockpit login (password + TOTP code) in a private browser window, keeping this SSH session open."
 echo "  Next: kh-svm doctor && kh-svm project new <name>" >&2
